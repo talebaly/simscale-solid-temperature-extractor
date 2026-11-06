@@ -1,0 +1,54 @@
+name: Build Windows executables
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Self-test with plain Python
+        run: python simscale_solid_temperature_extractor.py --selftest
+
+      - name: Build window app (SimScaleSolidTemperatureExtractor.exe)
+        run: pyinstaller --noconfirm --onefile --windowed --name SimScaleSolidTemperatureExtractor solid_temperature_extractor_gui.py
+
+      - name: Build command-line app (simscale_solid_temperature_extractor_cli.exe)
+        run: pyinstaller --noconfirm --onefile --console --name simscale_solid_temperature_extractor_cli simscale_solid_temperature_extractor.py
+
+      - name: Test command-line exe
+        run: |
+          dist\simscale_solid_temperature_extractor_cli.exe --selftest
+          dist\simscale_solid_temperature_extractor_cli.exe --help
+
+      - name: Test window exe (dependency check, no window)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "dist\SimScaleSolidTemperatureExtractor.exe" -ArgumentList "--selftest" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "SimScaleSolidTemperatureExtractor.exe --selftest failed with exit code $($p.ExitCode)" }
+
+      - name: Assemble tester package
+        shell: pwsh
+        run: |
+          $d = "package\SimScale_Solid_Temperature_Extractor"
+          New-Item -ItemType Directory -Force -Path "$d\dist" | Out-Null
+          Copy-Item dist\*.exe "$d\dist"
+          Copy-Item README.md $d
+          Get-ChildItem -Recurse package | Select-Object FullName, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SimScaleSolidTemperatureExtractor-windows
+          path: package

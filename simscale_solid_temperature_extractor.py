@@ -108,29 +108,41 @@ def solution_url(key, pid, sid, rid):
     return d["url"], d.get("uncompressedSizeInBytes")
 
 
-def download(url, key, dest, retries=6, prepare_retries=40, prepare_wait=45):
-    """Stream the archive to disk. SimScale builds the zip on the fly, so a broken transfer restarts.
+def download(url, key, dest, retries=60, prepare_retries=40, prepare_wait=45):
+    """Stream the archive to disk. SimScale builds the zip on the fly, so a broken transfer resumes where it left off.
 
     SimScale prepares large CHT result exports on demand; while that is in progress the download URL answers
     HTTP 404 ("Downloadable result objects not found"). This is expected and can take a while for a big mesh, so
     a 404 is retried patiently (default: every 45 s for up to 30 min, Ctrl+C / Cancel to give up sooner) instead
-    of being treated as a network hiccup."""
+    of being treated as a network hiccup. Network errors (timeouts, resets) get the same patience - a huge
+    transfer over a flaky connection needs far more than a couple of quick retries - and resume via HTTP Range
+    from the bytes already on disk instead of restarting from zero."""
     net_attempt, prep_attempt = 0, 0
+    dest = Path(dest)
     while True:
-        n, t0 = 0, time.time()
+        resume_from = dest.stat().st_size if dest.exists() else 0
+        n, t0 = resume_from, time.time()
         try:
-            req = urllib.request.Request(url, headers={"X-API-KEY": key})
-            with urllib.request.urlopen(req, timeout=900) as r, open(dest, "wb") as f:
-                while True:
-                    b = r.read(8 << 20)
-                    if not b:
-                        break
-                    f.write(b)
-                    n += len(b)
-                    rate = n / max(time.time() - t0, 1e-3) / 1e6
-                    print(f"\r  downloaded {n / 1e9:6.2f} GB  ({rate:5.1f} MB/s)", end="", flush=True)
+            headers = {"X-API-KEY": key}
+            if resume_from:
+                headers["Range"] = f"bytes={resume_from}-"
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=900) as r:
+                resumed = resume_from and r.status == 206
+                with open(dest, "ab" if resumed else "wb") as f:
+                    if resume_from and not resumed:
+                        n = 0  # server ignored the Range request - restarting from zero
+                    while True:
+                        b = r.read(8 << 20)
+                        if not b:
+                            break
+                        f.write(b)
+                        n += len(b)
+                        rate = (n - resume_from) / max(time.time() - t0, 1e-3) / 1e6
+                        print(f"\r  downloaded {n / 1e9:6.2f} GB  ({rate:5.1f} MB/s)", end="", flush=True)
             print()
             if not zipfile.is_zipfile(dest):
+                dest.unlink(missing_ok=True)  # stale/corrupt partial - next attempt must restart from zero
                 raise IOError("downloaded file is not a valid zip")
             return
         except urllib.error.HTTPError as e:
@@ -139,6 +151,9 @@ def download(url, key, dest, retries=6, prepare_retries=40, prepare_wait=45):
                 reason = "the API key was refused" if e.code == 401 else "access was refused"
                 sys.exit(f"Download failed (HTTP {e.code}): {reason}.")
             if e.code == 404:
+                # The export may have been invalidated/rebuilt server-side - a partial file on disk is no longer
+                # guaranteed to match, so drop it rather than risk resuming onto bytes from a different build.
+                dest.unlink(missing_ok=True)
                 prep_attempt += 1
                 if prep_attempt > prepare_retries:
                     sys.exit(f"Download failed (HTTP 404) after waiting about "

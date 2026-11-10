@@ -169,9 +169,47 @@ def opener(path):
     return gzip.open(path, "rt") if str(path).endswith(".gz") else open(path)
 
 
+def find(path):
+    for p in (str(path), str(path) + ".gz"):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def parse_cht_region_names(txt):
+    """-> (fluid_names, solid_names) as sets, from constant/chtRegionDict - SimScale's own record of which
+    region/zone names are solid vs fluid. Used in preference to guessing from field presence."""
+    fm = re.search(r"fluidRegionNames\s*\(([^)]*)\)", txt, re.S)
+    sm = re.search(r"solidRegionNames\s*\(([^)]*)\)", txt, re.S)
+    if not sm:
+        return None, None
+    return (set(fm.group(1).split()) if fm else set()), set(sm.group(1).split())
+
+
+def parse_cell_zones(path):
+    """-> {zone_name: np.ndarray of cell labels} from constant/polyMesh/cellZones."""
+    txt = opener(path).read()
+    pat = re.compile(r"([A-Za-z0-9_][\w.\-]*)\s*\{\s*type\s+cellZone;\s*cellLabels\s+List<label>\s*(\d+)\s*"
+                     r"\((.*?)\)\s*;\s*\}", re.S)
+    zones = {}
+    for m in pat.finditer(txt):
+        n = int(m.group(2))
+        labels = np.array(m.group(3).split(), dtype=np.int64)
+        if len(labels) != n:
+            sys.exit(f"cellZones: zone '{m.group(1)}' declares {n} cells but {len(labels)} were read.")
+        zones[m.group(1)] = labels
+    return zones
+
+
 def extract_needed(zip_path, out_dir):
-    """Extract the mesh and the T field of the last time step for every SOLID region. Returns
-    (case_dir, time_name, [region names])."""
+    """Extract the mesh and the T field of the last time step needed to get SOLID-region temperatures. Returns
+    (case_dir, time_name, info) where info is one of:
+      {"mode": "region", "regions": [names]}                         - one or more solid region directories
+      {"mode": "zones", "region": name, "solid_zone_names": {names}} - one mesh, solid cells selected by cellZone
+
+    Which region/zone names are solid is read from constant/chtRegionDict (SimScale always writes this for a CHT
+    run) where available; the heuristic "has a temperature field but no velocity field" is used as a fallback
+    only when that file is missing."""
     out_dir = Path(out_dir)
     with zipfile.ZipFile(zip_path) as z:
         names = z.namelist()
@@ -186,25 +224,53 @@ def extract_needed(zip_path, out_dir):
             pre = f"{t}/{reg}/" if reg else f"{t}/"
             return (pre + field) in nameset or (pre + field + ".gz") in nameset
 
-        cand = sorted({n.split("/")[1] for n in names if n.startswith(t + "/") and n.count("/") == 2})
+        cht_txt = None
+        for cand_name in ("constant/chtRegionDict", "constant/chtRegionDict.gz"):
+            if cand_name in nameset:
+                with z.open(cand_name) as f:
+                    raw = f.read()
+                cht_txt = gzip.decompress(raw).decode() if cand_name.endswith(".gz") else raw.decode()
+                break
+        _, cht_solid_names = parse_cht_region_names(cht_txt) if cht_txt else (None, None)
+
+        # OpenFOAM writes non-region bookkeeping folders directly under the time directory too
+        not_a_region = {"uniform", "lagrangian", "polyMesh"}
+        cand = sorted({n.split("/")[1] for n in names if n.startswith(t + "/") and n.count("/") == 2}
+                      - not_a_region)
+        info = None
         if cand:
-            # multi-region case: a region is a SOLID if it has T but no U (no flow)
-            regs = [r for r in cand if has("T", r) and not has("U", r)]
+            # multi-region case: one subregion directory per solid/fluid region
+            if cht_solid_names:
+                regs = [r for r in cand if r in cht_solid_names]
+                if not regs:
+                    log("  WARNING: chtRegionDict's solidRegionNames do not match any region directory; "
+                        "falling back to the T-without-U heuristic")
+            if not cht_solid_names or not regs:
+                regs = [r for r in cand if has("T", r) and not has("U", r)]
             if not regs:
                 sys.exit("No solid region (a region with a temperature field and no velocity field) found. "
                          "Is this a CHT run with at least one solid body?")
+            info = {"mode": "region", "regions": regs}
+            fld_regs = regs
         else:
-            # single-region case: fields directly under the time directory - only valid if it is a pure solid run
-            if has("T", "") and not has("U", ""):
-                regs = [""]
+            # single-mesh case: fields directly under the time directory
+            if not has("T", ""):
+                sys.exit("No temperature field (T) found at the last time step.")
+            if cht_solid_names:
+                # solid/fluid split is by constant/polyMesh/cellZones, not by region directory
+                info = {"mode": "zones", "region": "", "solid_zone_names": cht_solid_names}
+                fld_regs = [""]
+            elif not has("U", ""):
+                info = {"mode": "region", "regions": [""]}
+                fld_regs = [""]
             else:
-                sys.exit("Only one region was found and it has a velocity field, i.e. it is fluid, not solid. "
-                         "This tool reads solid-region temperatures from a multi-region CHT run.")
+                sys.exit("Only one region was found and it has a velocity field, i.e. it is fluid, not solid, "
+                         "and no constant/chtRegionDict was found to split it by solid/fluid cell zones.")
 
         want = []
         for n in names:
             parts = n.split("/")
-            for reg in regs:
+            for reg in fld_regs:
                 mesh = f"constant/{reg}/polyMesh/" if reg else "constant/polyMesh/"
                 fld = f"{t}/{reg}/" if reg else f"{t}/"
                 if n.startswith(mesh) and not n.endswith("/"):
@@ -213,14 +279,17 @@ def extract_needed(zip_path, out_dir):
                     want.append(n)
             if parts[0] == "system" and parts[-1] == "controlDict":
                 want.append(n)
-            if n in ("constant/regionProperties",):
+            if n in ("constant/regionProperties", "constant/chtRegionDict", "constant/chtRegionDict.gz"):
                 want.append(n)
+        if info["mode"] == "zones":
+            want += [n for n in ("constant/polyMesh/cellZones", "constant/polyMesh/cellZones.gz") if n in nameset]
         total = sum(z.getinfo(n).file_size for n in want)
-        log(f"  extracting {len(want)} files ({total / 1e9:.2f} GB) for time {t}, solid regions {regs or ['(single)']}")
+        label = info["regions"] if info["mode"] == "region" else ["(cell zones)"]
+        log(f"  extracting {len(want)} files ({total / 1e9:.2f} GB) for time {t}, solid {label}")
         for n in want:
             z.extract(n, out_dir)
     (out_dir / "case.foam").touch()
-    return out_dir, t, regs
+    return out_dir, t, info
 
 
 def read_labels(path):
@@ -378,18 +447,47 @@ def main(argv=None):
         zpath = work / "solution.zip"
         download(url, key, zpath)
 
-    case, tname, regs = extract_needed(zpath, work / "case")
+    case, tname, info = extract_needed(zpath, work / "case")
     log(f"time step {tname} (steady-state result)")
-    for reg in regs:
-        name = reg or "solid"
-        ncell = n_cells_of(case, reg)
-        log(f"  region '{name}': {ncell} cells, reading temperature field ...")
-        xyz, T_K = read_cells_vtk(case, reg, tname, ncell)
+
+    def report_and_write(name, xyz, T_K):
         xyz_r, T_r = coarsen(xyz, T_K, opt.positions)
         nrow = write_table(name, xyz_r, T_r, out)
         log(f"  {name}: {nrow} positions written, mean temperature "
             f"{float(np.mean(T_K)) - 273.15:.1f} degC, range "
             f"{float(np.min(T_K)) - 273.15:.1f} .. {float(np.max(T_K)) - 273.15:.1f} degC")
+
+    if info["mode"] == "region":
+        for reg in info["regions"]:
+            name = reg or "solid"
+            ncell = n_cells_of(case, reg)
+            log(f"  region '{name}': {ncell} cells, reading temperature field ...")
+            xyz, T_K = read_cells_vtk(case, reg, tname, ncell)
+            report_and_write(name, xyz, T_K)
+    else:
+        # single mesh (fluid and solid share one region); solid cells are selected via constant/polyMesh/cellZones
+        reg = info["region"]
+        ncell = n_cells_of(case, reg)
+        log(f"  mesh: {ncell} cells total, reading temperature field ...")
+        xyz, T_K = read_cells_vtk(case, reg, tname, ncell)
+        cz_path = find(Path(case) / "constant" / reg / "polyMesh" / "cellZones" if reg
+                        else Path(case) / "constant" / "polyMesh" / "cellZones")
+        if not cz_path:
+            sys.exit("constant/polyMesh/cellZones not found; cannot separate solid from fluid cells.")
+        zones = parse_cell_zones(cz_path)
+        missing = info["solid_zone_names"] - zones.keys()
+        if missing:
+            log(f"  WARNING: {len(missing)} solid zone name(s) from chtRegionDict have no matching cellZone: "
+                f"{sorted(missing)[:5]}{' ...' if len(missing) > 5 else ''}")
+        solid_zones = info["solid_zone_names"] & zones.keys()
+        if not solid_zones:
+            sys.exit("None of chtRegionDict's solidRegionNames match a cellZone in this mesh.")
+        idx = np.unique(np.concatenate([zones[n] for n in solid_zones]))
+        if idx.max(initial=-1) >= ncell:
+            sys.exit("A cellZone references a cell index outside the mesh; cell numbering did not match.")
+        log(f"  {len(solid_zones)} solid cell zones, {len(idx)} of {ncell} cells "
+            f"({len(idx) / ncell:.0%}) are solid")
+        report_and_write("solid", xyz[idx], T_K[idx])
 
     if not opt.keep_download:
         shutil.rmtree(work / "case", ignore_errors=True)

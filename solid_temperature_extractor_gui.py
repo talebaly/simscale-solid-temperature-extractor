@@ -46,6 +46,7 @@ class App(tk.Tk):
         self.link = tk.StringVar()
         self.zip_path = tk.StringVar()
         self.out = tk.StringVar(value=str(Path.home() / "Desktop" / "SimScale_Solid_Temperatures"))
+        self.write_htc = tk.BooleanVar(value=True)
         self._build()
         self.after(100, self._drain)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -81,8 +82,18 @@ class App(tk.Tk):
         ttk.Entry(frm, textvariable=self.out).grid(row=5, column=1, sticky="ew", **pad)
         ttk.Button(frm, text="Browse…", command=self._browse_out).grid(row=5, column=2, **pad)
 
+        ttk.Checkbutton(
+            frm, text="Also write a convective (HTC) table for thermomechanical", variable=self.write_htc
+        ).grid(row=6, column=1, columnspan=2, sticky="w", padx=10)
+        ttk.Label(
+            frm, text="Same positions as the temperature table, HTC = 1e9 W/(m²K) - thermomechanical only "
+                      "accepts whole-body temperatures, so this pair forces the wall temperature to follow the "
+                      "table via a convective boundary condition instead.",
+            foreground="#555555", wraplength=620, justify="left"
+        ).grid(row=7, column=1, columnspan=2, sticky="w", padx=10)
+
         btns = ttk.Frame(frm)
-        btns.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(14, 6))
+        btns.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(14, 6))
         self.btn_run = ttk.Button(btns, text="Extract temperatures", command=self._start)
         self.btn_run.pack(side="left")
         self.btn_cancel = ttk.Button(btns, text="Cancel", command=self._cancel, state="disabled")
@@ -93,8 +104,8 @@ class App(tk.Tk):
         self.progress.pack(side="left", padx=8)
 
         self.log = ScrolledText(frm, height=16, state="disabled", font=("Courier", 10))
-        self.log.grid(row=7, column=0, columnspan=3, sticky="nsew", padx=10, pady=6)
-        frm.rowconfigure(7, weight=1)
+        self.log.grid(row=9, column=0, columnspan=3, sticky="nsew", padx=10, pady=6)
+        frm.rowconfigure(9, weight=1)
 
     # ------------------------------------------------------------------ actions
     def _toggle_key(self):
@@ -138,6 +149,8 @@ class App(tk.Tk):
             argv += ["--run", link]
             env["SIMSCALE_API_KEY"] = key
         argv += ["--out", self.out.get()]
+        if not self.write_htc.get():
+            argv += ["--no-htc-table"]
         return argv, env
 
     def _start(self):

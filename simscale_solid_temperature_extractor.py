@@ -3,13 +3,16 @@
 SimScale solid-temperature extractor - steady-state solid temperature field from a finished SimScale CHT run.
 
 Downloads the OpenFOAM results of a finished conjugate-heat-transfer (CHT) run, reads the temperature field of
-every SOLID region at the last (steady-state) time step, and writes one table per solid region:
+every SOLID region at the last (steady-state) time step, and writes two tables per solid region, at the same
+X,Y,Z positions:
 
-    t,X,Y,Z,Temperature value C
+    <region>_temperature.csv   t,X,Y,Z,Temperature value C
+    <region>_HTC.csv           t,X,Y,Z,HTC                 (constant, default 1e9 W/(m2 K))
 
-ready to be used as an initial / applied temperature field in a SimScale thermomechanical simulation (the solid
-geometry of the CHT run and the thermomechanical run must match). This tool only reads solid-region temperatures -
-no heat transfer coefficient is computed (see the sibling tool SimScale_HTC_Extractor for that).
+ready to be used as the reference-temperature and HTC tables of a convective boundary condition in a SimScale
+thermomechanical simulation - the workaround for applying a spatially-varying temperature where only a uniform
+per-body value is accepted directly (the solid geometry of the CHT run and the thermomechanical run must match).
+Use --no-htc-table to only write the temperature table, e.g. for a uniform whole-body initial condition.
 
 Usage (Windows: use "py" instead of "python3"):
     python3 simscale_solid_temperature_extractor.py --run <simscale workbench link to a finished run>
@@ -26,6 +29,7 @@ from pathlib import Path
 import numpy as np
 
 API = "https://api.simscale.com/v0"
+FORCED_HTC = 1e9  # W/(m2 K) - "effectively infinite", forces wall temperature to the reference-temperature table
 
 
 # ----------------------------------------------------------------------------------------- SimScale API
@@ -401,12 +405,29 @@ def coarsen(xyz, T, target):
     return merge(hi)
 
 
+def sort_order(xyz):
+    return np.lexsort((xyz[:, 2], xyz[:, 1], xyz[:, 0]))
+
+
 def write_table(name, xyz, T_K, out_dir):
-    o = np.lexsort((xyz[:, 2], xyz[:, 1], xyz[:, 0]))
+    o = sort_order(xyz)
     X, Y, Z, Tc = xyz[o, 0], xyz[o, 1], xyz[o, 2], T_K[o] - 273.15
     rows = [f"0,{X[i]:.9g},{Y[i]:.9g},{Z[i]:.9g},{Tc[i]:.6g}" for i in range(len(X))]
     (out_dir / f"{name}_temperature.csv").write_text(
         "t,X,Y,Z,Temperature value C\n" + "\n".join(rows) + "\n", encoding="utf-8")
+    return len(rows)
+
+
+def write_htc_table(name, xyz, htc_value, out_dir):
+    """Companion table at the same X,Y,Z positions as <name>_temperature.csv, constant HTC everywhere.
+
+    Workaround for thermomechanical not accepting a spatially-varying temperature boundary/initial condition
+    directly: a convective BC with this (effectively infinite) HTC and the temperature table as the reference
+    temperature forces the wall temperature to follow the table instead."""
+    o = sort_order(xyz)
+    X, Y, Z = xyz[o, 0], xyz[o, 1], xyz[o, 2]
+    rows = [f"0,{X[i]:.9g},{Y[i]:.9g},{Z[i]:.9g},{htc_value:.6g}" for i in range(len(X))]
+    (out_dir / f"{name}_HTC.csv").write_text("t,X,Y,Z,HTC\n" + "\n".join(rows) + "\n", encoding="utf-8")
     return len(rows)
 
 
@@ -431,6 +452,12 @@ def main(argv=None):
     ap.add_argument("--out", default="solid_temperatures", help="output folder (default: solid_temperatures)")
     ap.add_argument("--positions", type=int, default=20000,
                     help="target number of positions per table (default 20000; 0 = keep every cell)")
+    ap.add_argument("--htc", type=float, default=FORCED_HTC, metavar="W/m2K",
+                    help=f"constant HTC written to the companion <region>_HTC.csv table, same X,Y,Z positions as "
+                         f"the temperature table (default {FORCED_HTC:.0g} W/(m2 K) - the SimScale workaround for "
+                         "a spatially-varying temperature BC/IC: use this as the HTC and the temperature table as "
+                         "the reference temperature of a convective boundary condition)")
+    ap.add_argument("--no-htc-table", action="store_true", help="only write the temperature table, skip the HTC one")
     ap.add_argument("--keep-download", action="store_true", help="keep the downloaded zip and the extracted files")
     ap.add_argument("--dry-run", action="store_true", help="only resolve the run and show the download size")
     ap.add_argument("--selftest", action="store_true", help="check that all dependencies load, then exit")
@@ -468,9 +495,12 @@ def main(argv=None):
     def report_and_write(name, xyz, T_K):
         xyz_r, T_r = coarsen(xyz, T_K, opt.positions)
         nrow = write_table(name, xyz_r, T_r, out)
+        if not opt.no_htc_table:
+            write_htc_table(name, xyz_r, opt.htc, out)
         log(f"  {name}: {nrow} positions written, mean temperature "
             f"{float(np.mean(T_K)) - 273.15:.1f} degC, range "
-            f"{float(np.min(T_K)) - 273.15:.1f} .. {float(np.max(T_K)) - 273.15:.1f} degC")
+            f"{float(np.min(T_K)) - 273.15:.1f} .. {float(np.max(T_K)) - 273.15:.1f} degC"
+            + ("" if opt.no_htc_table else f"; HTC table written at {opt.htc:.0g} W/(m2 K)"))
 
     if info["mode"] == "region":
         for reg in info["regions"]:

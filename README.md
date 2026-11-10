@@ -56,7 +56,9 @@ The API key comes from `--api-key`, else the `SIMSCALE_API_KEY` environment vari
 
 ## 4. Output
 
-One file per solid region in the CHT case, `<region>_temperature.csv`:
+Two files per solid region in the CHT case, at the same X,Y,Z positions:
+
+**`<region>_temperature.csv`**
 
 | Column | Meaning | Unit |
 |---|---|---|
@@ -64,10 +66,20 @@ One file per solid region in the CHT case, `<region>_temperature.csv`:
 | `X, Y, Z` | cell-centre position | m |
 | `Temperature value C` | steady-state solid temperature | °C |
 
-In the thermomechanical simulation, use the table as the value source for a temperature boundary condition /
-initial condition on the corresponding solid body (independent variables X, Y, Z; the value is the last column).
+**`<region>_HTC.csv`** - same `t,X,Y,Z` rows, with a constant `HTC` column (default `1e9` W/(m²K), `--htc` to
+change it, `--no-htc-table` to skip this file).
+
+SimScale thermomechanical does not accept a spatially-varying temperature as a boundary/initial condition
+directly - only a uniform value per body. The workaround (used for the SMK cool-down case too) is a **convective**
+boundary condition: use `<region>_temperature.csv` as its reference temperature table and `<region>_HTC.csv` as
+its HTC table. An effectively-infinite HTC forces the wall temperature to follow the reference-temperature table,
+so the result is the same as a true spatially-varying temperature BC/IC. Both tables share identical `X,Y,Z` rows,
+so the solver can combine them row by row. If you only need a whole-body uniform initial temperature (no spatial
+variation), the `_temperature.csv` table alone (as a per-body `FIXED_TEMPERATURE_VALUE`/initial condition) is
+enough and `_HTC.csv` can be ignored or skipped with `--no-htc-table`.
+
 If a solid region's table is too large for your mesh / UI, reduce `--positions` (voxel-averaged to roughly that
-many points; default 20000, `0` keeps every mesh cell).
+many points; default 20000, `0` keeps every mesh cell) - both tables use the same reduced positions.
 
 ## 5. How solid regions are found
 
@@ -81,6 +93,8 @@ if it has a temperature field (`T`) but no velocity field (`U`) - i.e. no flow i
 |---|---|---|
 | `--out` | `solid_temperatures` | Output folder |
 | `--positions` | `20000` | Target number of positions per table (voxel-binned mean); `0` = every cell |
+| `--htc` | `1e9` | Constant HTC (W/(m²K)) written to `<region>_HTC.csv` |
+| `--no-htc-table` | off | Only write `<region>_temperature.csv`, skip the HTC companion table |
 | `--keep-download` | off | Keep the downloaded zip and extracted files (several GB) |
 | `--dry-run` | off | Only resolve the run and print the result size |
 | `--selftest` | - | Check that numpy/vtk load, then exit |

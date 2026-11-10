@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Desktop window for the SimScale solid temperature extractor (Tkinter, runs on Windows, macOS and Linux).
 
-Deliberately minimal: one link, one output folder, one button."""
+Deliberately minimal: one link, one output folder, one button. Runs the extractor as a child process (not in-process)
+so Cancel can stop it immediately and cleanly, and the API key travels via an environment variable rather than a
+visible command-line argument."""
 import os, queue, subprocess, sys, threading
 import tkinter as tk
 from pathlib import Path
@@ -13,34 +15,40 @@ import simscale_solid_temperature_extractor as core
 APP_TITLE = "SimScale Solid Temperature Extractor"
 
 
-class QueueWriter:
-    """File-like object that forwards text written by the worker thread to the GUI."""
+def resource_dir():
+    """Folder with bundled files: PyInstaller unpack folder, else the folder of this script."""
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 
-    def __init__(self, q):
-        self.q = q
 
-    def write(self, text):
-        if text:
-            self.q.put(text)
-
-    def flush(self):
-        pass
+def cli_command():
+    """-> argv prefix that runs the command-line tool: the sibling .exe when frozen, else `python3 script.py`."""
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        name = "simscale_solid_temperature_extractor_cli.exe" if sys.platform.startswith("win") \
+            else "simscale_solid_temperature_extractor_cli"
+        cli = exe_dir / name
+        if not cli.exists():
+            raise FileNotFoundError(f"{name} not found next to {sys.executable}")
+        return [str(cli)]
+    return [sys.executable, str(resource_dir() / "simscale_solid_temperature_extractor.py")]
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("760x560")
-        self.minsize(640, 460)
+        self.geometry("760x580")
+        self.minsize(640, 480)
         self.q = queue.Queue()
-        self.worker = None
+        self.reader = None
+        self.proc = None
         self.api_key = tk.StringVar(value=os.environ.get("SIMSCALE_API_KEY", ""))
         self.link = tk.StringVar()
         self.zip_path = tk.StringVar()
         self.out = tk.StringVar(value=str(Path.home() / "Desktop" / "SimScale_Solid_Temperatures"))
         self._build()
         self.after(100, self._drain)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------------------------------ layout
     def _build(self):
@@ -50,7 +58,14 @@ class App(tk.Tk):
         frm.columnconfigure(1, weight=1)
 
         ttk.Label(frm, text="1. SimScale API key", font=("", 10, "bold")).grid(row=0, column=0, sticky="w", **pad)
-        ttk.Entry(frm, textvariable=self.api_key, show="•").grid(row=0, column=1, columnspan=2, sticky="ew", **pad)
+        key_row = ttk.Frame(frm)
+        key_row.grid(row=0, column=1, columnspan=2, sticky="ew", **pad)
+        key_row.columnconfigure(0, weight=1)
+        self.key_entry = ttk.Entry(key_row, textvariable=self.api_key, show="•")
+        self.key_entry.grid(row=0, column=0, sticky="ew")
+        self.show_key = tk.BooleanVar(value=False)
+        ttk.Checkbutton(key_row, text="Show", variable=self.show_key, command=self._toggle_key).grid(
+            row=0, column=1, padx=(8, 0))
         ttk.Label(frm, text="Avatar (top right) → User Settings → API Keys → Generate Key.",
                   foreground="#555555").grid(row=1, column=1, columnspan=2, sticky="w", padx=10)
 
@@ -70,9 +85,11 @@ class App(tk.Tk):
         btns.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(14, 6))
         self.btn_run = ttk.Button(btns, text="Extract temperatures", command=self._start)
         self.btn_run.pack(side="left")
+        self.btn_cancel = ttk.Button(btns, text="Cancel", command=self._cancel, state="disabled")
+        self.btn_cancel.pack(side="left", padx=8)
         self.btn_open = ttk.Button(btns, text="Open output folder", command=self._open_out)
         self.btn_open.pack(side="left", padx=8)
-        self.progress = ttk.Progressbar(btns, mode="indeterminate", length=180)
+        self.progress = ttk.Progressbar(btns, mode="indeterminate", length=160)
         self.progress.pack(side="left", padx=8)
 
         self.log = ScrolledText(frm, height=16, state="disabled", font=("Courier", 10))
@@ -80,6 +97,9 @@ class App(tk.Tk):
         frm.rowconfigure(7, weight=1)
 
     # ------------------------------------------------------------------ actions
+    def _toggle_key(self):
+        self.key_entry.configure(show="" if self.show_key.get() else "•")
+
     def _pick_zip(self):
         p = filedialog.askopenfilename(title="SimScale result archive", filetypes=[("Zip archive", "*.zip")])
         if p:
@@ -98,56 +118,84 @@ class App(tk.Tk):
             return
         open_with_system(p)
 
-    def _build_argv(self):
+    def _build_command(self):
+        """-> (argv, env) for the child process. The API key travels via env, never on the command line."""
         link, zpath = self.link.get().strip(), self.zip_path.get().strip()
         if not link and not zpath:
             raise ValueError("Paste a SimScale link, or choose a result zip.")
         if link and zpath:
             raise ValueError("Use either a link or a result zip, not both.")
-        argv = []
+        env = dict(os.environ)
+        argv = cli_command()
         if zpath:
             if not Path(zpath).exists():
                 raise ValueError(f"Zip file not found: {zpath}")
             argv += ["--zip", zpath]
         else:
-            if not self.api_key.get().strip():
+            key = self.api_key.get().strip()
+            if not key:
                 raise ValueError("Enter the SimScale API key.")
-            argv += ["--run", link, "--api-key", self.api_key.get().strip()]
+            argv += ["--run", link]
+            env["SIMSCALE_API_KEY"] = key
         argv += ["--out", self.out.get()]
-        return argv
+        return argv, env
 
     def _start(self):
-        if self.worker and self.worker.is_alive():
+        if self.proc is not None:
             return
         try:
-            argv = self._build_argv()
-        except ValueError as e:
+            argv, env = self._build_command()
+        except (ValueError, FileNotFoundError) as e:
             messagebox.showerror(APP_TITLE, str(e))
             return
         self._clear()
         self.btn_run.configure(state="disabled")
+        self.btn_cancel.configure(state="normal")
         self.progress.start(12)
-        self.worker = threading.Thread(target=self._work, args=(argv,), daemon=True)
-        self.worker.start()
-
-    def _work(self, argv):
-        w = QueueWriter(self.q)
-        old = sys.stdout, sys.stderr
-        sys.stdout = sys.stderr = w
-        ok = False
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
         try:
-            core.main(argv)
-            ok = True
-        except SystemExit as e:
-            if e.code not in (None, 0):
-                w.write(f"\nERROR: {e.code}\n")
-            else:
-                ok = True
-        except Exception as e:  # report anything unexpected in the log instead of crashing the window
-            w.write(f"\nERROR: {type(e).__name__}: {e}\n")
+            self.proc = subprocess.Popen(
+                argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                env=env, creationflags=creationflags)
+        except OSError as e:
+            messagebox.showerror(APP_TITLE, f"Could not start the extractor: {e}")
+            self._reset_buttons()
+            return
+        self.reader = threading.Thread(target=self._read_proc, daemon=True)
+        self.reader.start()
+
+    def _cancel(self):
+        if self.proc is not None:
+            self.q.put("\n--- cancelling ---\n")
+            try:
+                self.proc.terminate()
+            except OSError:
+                pass
+        self.btn_cancel.configure(state="disabled")
+
+    def _read_proc(self):
+        proc = self.proc
+        try:
+            for line in proc.stdout:
+                self.q.put(line)
         finally:
-            sys.stdout, sys.stderr = old
-            self.q.put(("__done__", ok))
+            proc.stdout.close()
+            rc = proc.wait()
+            self.q.put(("__done__", rc == 0, rc))
+
+    def _on_close(self):
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+            except OSError:
+                pass
+        self.destroy()
+
+    def _reset_buttons(self):
+        self.proc = None
+        self.progress.stop()
+        self.btn_run.configure(state="normal")
+        self.btn_cancel.configure(state="disabled")
 
     # ------------------------------------------------------------------ log handling
     def _clear(self):
@@ -170,9 +218,15 @@ class App(tk.Tk):
             while True:
                 item = self.q.get_nowait()
                 if isinstance(item, tuple) and item and item[0] == "__done__":
-                    self.progress.stop()
-                    self.btn_run.configure(state="normal")
-                    self._append("\n" + ("Finished." if item[1] else "Stopped with an error (see above).") + "\n")
+                    _, ok, rc = item
+                    if ok:
+                        msg = "Finished."
+                    elif rc < 0:
+                        msg = "Cancelled."
+                    else:
+                        msg = "Stopped with an error (see above)."
+                    self._append("\n" + msg + "\n")
+                    self._reset_buttons()
                 else:
                     self._append(item)
         except queue.Empty:

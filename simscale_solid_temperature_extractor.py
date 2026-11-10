@@ -127,6 +127,19 @@ def download(url, key, dest, retries=6):
             if not zipfile.is_zipfile(dest):
                 raise IOError("downloaded file is not a valid zip")
             return
+        except urllib.error.HTTPError as e:
+            print()
+            if e.code in (401, 403, 404):
+                # not a transient network problem - retrying the identical request will not help
+                reason = {401: "the API key was refused", 403: "access was refused",
+                          404: "SimScale has no downloadable result for this run"}[e.code]
+                sys.exit(f"Download failed (HTTP {e.code}): {reason}. For a 404, the run's raw field export may "
+                         "not have been generated/kept by SimScale (open the run in the Workbench and check "
+                         "whether its results can still be downloaded there).")
+            log(f"  download attempt {attempt} failed after {n / 1e6:.0f} MB: HTTP {e.code}")
+            if attempt == retries:
+                sys.exit("Download failed. A stable network connection is needed for these large archives.")
+            time.sleep(20)
         except Exception as e:
             print()
             log(f"  download attempt {attempt} failed after {n / 1e6:.0f} MB: {type(e).__name__}: {e}")

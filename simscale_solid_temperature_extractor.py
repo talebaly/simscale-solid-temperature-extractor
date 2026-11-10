@@ -108,9 +108,15 @@ def solution_url(key, pid, sid, rid):
     return d["url"], d.get("uncompressedSizeInBytes")
 
 
-def download(url, key, dest, retries=6):
-    """Stream the archive to disk. SimScale builds the zip on the fly, so a broken transfer restarts."""
-    for attempt in range(1, retries + 1):
+def download(url, key, dest, retries=6, prepare_retries=40, prepare_wait=45):
+    """Stream the archive to disk. SimScale builds the zip on the fly, so a broken transfer restarts.
+
+    SimScale prepares large CHT result exports on demand; while that is in progress the download URL answers
+    HTTP 404 ("Downloadable result objects not found"). This is expected and can take a while for a big mesh, so
+    a 404 is retried patiently (default: every 45 s for up to 30 min, Ctrl+C / Cancel to give up sooner) instead
+    of being treated as a network hiccup."""
+    net_attempt, prep_attempt = 0, 0
+    while True:
         n, t0 = 0, time.time()
         try:
             req = urllib.request.Request(url, headers={"X-API-KEY": key})
@@ -129,21 +135,31 @@ def download(url, key, dest, retries=6):
             return
         except urllib.error.HTTPError as e:
             print()
-            if e.code in (401, 403, 404):
-                # not a transient network problem - retrying the identical request will not help
-                reason = {401: "the API key was refused", 403: "access was refused",
-                          404: "SimScale has no downloadable result for this run"}[e.code]
-                sys.exit(f"Download failed (HTTP {e.code}): {reason}. For a 404, the run's raw field export may "
-                         "not have been generated/kept by SimScale (open the run in the Workbench and check "
-                         "whether its results can still be downloaded there).")
-            log(f"  download attempt {attempt} failed after {n / 1e6:.0f} MB: HTTP {e.code}")
-            if attempt == retries:
+            if e.code in (401, 403):
+                reason = "the API key was refused" if e.code == 401 else "access was refused"
+                sys.exit(f"Download failed (HTTP {e.code}): {reason}.")
+            if e.code == 404:
+                prep_attempt += 1
+                if prep_attempt > prepare_retries:
+                    sys.exit(f"Download failed (HTTP 404) after waiting about "
+                             f"{prepare_retries * prepare_wait // 60} min: SimScale still has no downloadable "
+                             "result for this run. Large CHT exports are built on demand and can take a while - "
+                             "check in the Workbench whether the manual download has finished preparing there, "
+                             "or failed.")
+                log(f"  SimScale is still preparing this result (HTTP 404; large CHT exports can take a while) - "
+                    f"waiting {prepare_wait}s (check {prep_attempt}/{prepare_retries}) ...")
+                time.sleep(prepare_wait)
+                continue
+            net_attempt += 1
+            log(f"  download attempt {net_attempt} failed after {n / 1e6:.0f} MB: HTTP {e.code}")
+            if net_attempt >= retries:
                 sys.exit("Download failed. A stable network connection is needed for these large archives.")
             time.sleep(20)
         except Exception as e:
             print()
-            log(f"  download attempt {attempt} failed after {n / 1e6:.0f} MB: {type(e).__name__}: {e}")
-            if attempt == retries:
+            net_attempt += 1
+            log(f"  download attempt {net_attempt} failed after {n / 1e6:.0f} MB: {type(e).__name__}: {e}")
+            if net_attempt >= retries:
                 sys.exit("Download failed. A stable network connection is needed for these large archives.")
             time.sleep(20)
 

@@ -81,6 +81,9 @@ enough and `_HTC.csv` can be ignored or skipped with `--no-htc-table`.
 If a solid region's table is too large for your mesh / UI, reduce `--positions` (voxel-averaged to roughly that
 many points; default 20000, `0` keeps every mesh cell) - both tables use the same reduced positions.
 
+**See [`THERMOMECHANICAL_SETUP.md`](THERMOMECHANICAL_SETUP.md) for the exact Workbench steps to apply this table
+pair as a convective boundary condition.**
+
 ## 5. How solid regions are found
 
 A SimScale CHT case is split into regions. This tool extracts the last time step and treats a region as **solid**

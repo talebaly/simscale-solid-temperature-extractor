@@ -30,6 +30,11 @@ import numpy as np
 
 API = "https://api.simscale.com/v0"
 FORCED_HTC = 1e9  # W/(m2 K) - "effectively infinite", forces wall temperature to the reference-temperature table
+MANUAL_DOWNLOAD_HINT = (
+    "If this keeps failing, download the result manually instead: open the run in the SimScale Workbench, "
+    "download the solution/result there (uses your browser login, not the API key, so it can succeed even when "
+    "this doesn't), then re-run this tool with --zip <path to the downloaded zip> (or, in the window, use "
+    "\"Use result zip instead...\").")
 
 
 # ----------------------------------------------------------------------------------------- SimScale API
@@ -153,7 +158,7 @@ def download(url, key, dest, retries=60, prepare_retries=40, prepare_wait=45):
             print()
             if e.code in (401, 403):
                 reason = "the API key was refused" if e.code == 401 else "access was refused"
-                sys.exit(f"Download failed (HTTP {e.code}): {reason}.")
+                sys.exit(f"Download failed (HTTP {e.code}): {reason}.\n{MANUAL_DOWNLOAD_HINT}")
             if e.code == 404:
                 # The export may have been invalidated/rebuilt server-side - a partial file on disk is no longer
                 # guaranteed to match, so drop it rather than risk resuming onto bytes from a different build.
@@ -162,9 +167,8 @@ def download(url, key, dest, retries=60, prepare_retries=40, prepare_wait=45):
                 if prep_attempt > prepare_retries:
                     sys.exit(f"Download failed (HTTP 404) after waiting about "
                              f"{prepare_retries * prepare_wait // 60} min: SimScale still has no downloadable "
-                             "result for this run. Large CHT exports are built on demand and can take a while - "
-                             "check in the Workbench whether the manual download has finished preparing there, "
-                             "or failed.")
+                             "result for this run. Large CHT exports are built on demand and can take a while.\n"
+                             f"{MANUAL_DOWNLOAD_HINT}")
                 log(f"  SimScale is still preparing this result (HTTP 404; large CHT exports can take a while) - "
                     f"waiting {prepare_wait}s (check {prep_attempt}/{prepare_retries}) ...")
                 time.sleep(prepare_wait)
@@ -172,14 +176,16 @@ def download(url, key, dest, retries=60, prepare_retries=40, prepare_wait=45):
             net_attempt += 1
             log(f"  download attempt {net_attempt} failed after {n / 1e6:.0f} MB: HTTP {e.code}")
             if net_attempt >= retries:
-                sys.exit("Download failed. A stable network connection is needed for these large archives.")
+                sys.exit("Download failed. A stable network connection is needed for these large archives.\n"
+                         f"{MANUAL_DOWNLOAD_HINT}")
             time.sleep(20)
         except Exception as e:
             print()
             net_attempt += 1
             log(f"  download attempt {net_attempt} failed after {n / 1e6:.0f} MB: {type(e).__name__}: {e}")
             if net_attempt >= retries:
-                sys.exit("Download failed. A stable network connection is needed for these large archives.")
+                sys.exit("Download failed. A stable network connection is needed for these large archives.\n"
+                         f"{MANUAL_DOWNLOAD_HINT}")
             time.sleep(20)
 
 

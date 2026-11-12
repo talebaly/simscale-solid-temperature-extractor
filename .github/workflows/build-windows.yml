@@ -46,6 +46,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$d\dist" | Out-Null
           Copy-Item dist\*.exe "$d\dist"
           Copy-Item README.md $d
+          Copy-Item THERMOMECHANICAL_SETUP.md $d
+          Copy-Item THERMOMECHANICAL_SETUP.md "$d\dist"
           Get-ChildItem -Recurse package | Select-Object FullName, Length
 
       - uses: actions/upload-artifact@v4

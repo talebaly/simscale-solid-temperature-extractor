@@ -33,6 +33,13 @@ def cli_command():
     return [sys.executable, str(resource_dir() / "simscale_solid_temperature_extractor.py")]
 
 
+def help_file_path():
+    """-> THERMOMECHANICAL_SETUP.md: sibling of the frozen exe (packaged there by the build), else sibling script."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent / "THERMOMECHANICAL_SETUP.md"
+    return resource_dir() / "THERMOMECHANICAL_SETUP.md"
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -100,6 +107,8 @@ class App(tk.Tk):
         self.btn_cancel.pack(side="left", padx=8)
         self.btn_open = ttk.Button(btns, text="Open output folder", command=self._open_out)
         self.btn_open.pack(side="left", padx=8)
+        self.btn_help = ttk.Button(btns, text="Help: using the tables", command=self._open_help)
+        self.btn_help.pack(side="left", padx=8)
         self.progress = ttk.Progressbar(btns, mode="indeterminate", length=160)
         self.progress.pack(side="left", padx=8)
 
@@ -126,6 +135,13 @@ class App(tk.Tk):
         p = Path(self.out.get())
         if not p.exists():
             messagebox.showinfo(APP_TITLE, "The output folder does not exist yet. Run the extraction first.")
+            return
+        open_with_system(p)
+
+    def _open_help(self):
+        p = help_file_path()
+        if not p.exists():
+            messagebox.showerror(APP_TITLE, f"Help file not found: {p}")
             return
         open_with_system(p)
 

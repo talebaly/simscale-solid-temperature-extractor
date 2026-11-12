@@ -4,7 +4,7 @@
 Deliberately minimal: one link, one output folder, one button. Runs the extractor as a child process (not in-process)
 so Cancel can stop it immediately and cleanly, and the API key travels via an environment variable rather than a
 visible command-line argument."""
-import os, queue, subprocess, sys, threading
+import os, queue, re, subprocess, sys, threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -13,6 +13,121 @@ from tkinter.scrolledtext import ScrolledText
 import simscale_solid_temperature_extractor as core
 
 APP_TITLE = "SimScale Solid Temperature Extractor"
+
+
+# ----------------------------------------------------------------------------------------- minimal markdown viewer
+def _md_inline(txt, line, block_tags):
+    """Insert one line of text into a Text widget, rendering **bold**, `code` and [text](url) links (bold may
+    nest a code span, e.g. **the `X` column**, so a bold match recurses to still catch the code span inside)."""
+    line = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 (\2)", line)
+    for part in re.split(r"(\*\*.*?\*\*|`[^`]+`)", line):
+        if not part:
+            continue
+        if part.startswith("**") and part.endswith("**") and len(part) >= 4:
+            _md_inline(txt, part[2:-2], block_tags + ("bold",))
+        elif part.startswith("`") and part.endswith("`") and len(part) >= 2:
+            txt.insert("end", part[1:-1], block_tags + ("code",))
+        else:
+            txt.insert("end", part, block_tags)
+
+
+def render_markdown(txt, md):
+    """Render a (deliberately small) subset of Markdown into a Text widget: headings, bold, inline/fenced code,
+    bullet/numbered/checkbox lists, tables (as monospace rows) and rules. Good enough for this app's own docs,
+    not a general Markdown engine."""
+    in_code = False
+    para = []  # buffered soft-wrapped lines of the block in progress, joined before inline rendering
+    block_tag, block_prefix = "body", ""  # tag/leading marker for the block currently being buffered
+
+    def flush():
+        if para:
+            if block_prefix:
+                txt.insert("end", block_prefix, (block_tag,))
+            _md_inline(txt, " ".join(para), (block_tag,))
+            txt.insert("end", "\n")
+            para.clear()
+
+    def start_block(tag, prefix, first_line):
+        nonlocal block_tag, block_prefix
+        flush()
+        block_tag, block_prefix = tag, prefix
+        para.append(first_line)
+
+    for raw in md.split("\n"):
+        line = raw.rstrip("\n")
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            flush()
+            in_code = not in_code
+            continue
+        if in_code:
+            txt.insert("end", line + "\n", ("codeblock",))
+            continue
+        if not stripped:
+            flush()
+            continue
+        if stripped in ("---", "***", "___"):
+            flush()
+            txt.insert("end", "─" * 70 + "\n", ("hr",))
+            continue
+        m = re.match(r"^(#{1,3})\s+(.*)", stripped)
+        if m:
+            flush()
+            tag = {1: "h1", 2: "h2", 3: "h3"}[len(m.group(1))]
+            _md_inline(txt, m.group(2), (tag,))
+            txt.insert("end", "\n")
+            continue
+        m = re.match(r"^[-*]\s+\[([ xX])\]\s+(.*)", stripped)
+        if m:
+            start_block("bullet", "☑ " if m.group(1).lower() == "x" else "☐ ", m.group(2))
+            continue
+        m = re.match(r"^[-*]\s+(.*)", stripped)
+        if m:
+            start_block("bullet", "•  ", m.group(1))
+            continue
+        m = re.match(r"^(\d+\.)\s+(.*)", stripped)
+        if m:
+            start_block("bullet", f"{m.group(1)}  ", m.group(2))
+            continue
+        if stripped.startswith("|"):
+            flush()
+            txt.insert("end", line + "\n", ("table",))
+            continue
+        if not para:  # first line of a new plain paragraph (not continuing a list item)
+            block_tag, block_prefix = "body", ""
+        para.append(stripped)
+    flush()
+
+
+def open_markdown_viewer(parent, title, md_text):
+    win = tk.Toplevel(parent)
+    win.title(title)
+    win.geometry("820x640")
+    win.minsize(500, 360)
+    frm = ttk.Frame(win)
+    frm.pack(fill="both", expand=True)
+    txt = tk.Text(frm, wrap="word", padx=18, pady=16, bg="white", fg="#1a1a1a", relief="flat",
+                   font=("Helvetica", 12), cursor="arrow")
+    vsb = ttk.Scrollbar(frm, orient="vertical", command=txt.yview)
+    txt.configure(yscrollcommand=vsb.set)
+    vsb.pack(side="right", fill="y")
+    txt.pack(side="left", fill="both", expand=True)
+
+    txt.tag_configure("h1", font=("Helvetica", 19, "bold"), spacing1=16, spacing3=10)
+    txt.tag_configure("h2", font=("Helvetica", 15, "bold"), spacing1=14, spacing3=8)
+    txt.tag_configure("h3", font=("Helvetica", 12, "bold"), spacing1=10, spacing3=6)
+    txt.tag_configure("bold", font=("Helvetica", 12, "bold"))
+    txt.tag_configure("code", font=("Courier", 11), background="#f0f0f0")
+    txt.tag_configure("codeblock", font=("Courier", 10), background="#f5f5f5", lmargin1=18, lmargin2=18)
+    txt.tag_configure("bullet", font=("Helvetica", 12), lmargin1=22, lmargin2=40, spacing1=2)
+    txt.tag_configure("table", font=("Courier", 10))
+    txt.tag_configure("hr", font=("Helvetica", 6), foreground="#bbbbbb")
+    txt.tag_configure("body", font=("Helvetica", 12), spacing1=2)
+
+    render_markdown(txt, md_text)
+    txt.configure(state="disabled")
+    ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0, 10))
+    return win
 
 
 def resource_dir():
@@ -143,7 +258,7 @@ class App(tk.Tk):
         if not p.exists():
             messagebox.showerror(APP_TITLE, f"Help file not found: {p}")
             return
-        open_with_system(p)
+        open_markdown_viewer(self, "Using the tables in a thermomechanical simulation", p.read_text(encoding="utf-8"))
 
     def _build_command(self):
         """-> (argv, env) for the child process. The API key travels via env, never on the command line."""

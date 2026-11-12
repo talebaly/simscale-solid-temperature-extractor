@@ -484,10 +484,17 @@ def main(argv=None):
         sid, rid, rname = resolve_run(key, pid, kind, ident)
         url, size = solution_url(key, pid, sid, rid)
         log(f"project {pid}, simulation {sid}, run {rid} ('{rname}'), solution ~{(size or 0) / 1e9:.1f} GB")
+        if not size:
+            log("  WARNING: SimScale reports this result's size as 0 bytes. A result that is genuinely still "
+                "being prepared normally reports its real (non-zero) size from the start and only the download "
+                "itself briefly 404s; a 0-byte size usually means there is nothing to export (e.g. full-field "
+                "results were disabled for this run, or they were purged). Trying only a few times before giving "
+                "up - check the run in the Workbench, or contact SimScale support with this run ID if you still "
+                "expect a result.")
         if opt.dry_run:
             return
         zpath = work / "solution.zip"
-        download(url, key, zpath)
+        download(url, key, zpath, prepare_retries=(40 if size else 4))
 
     case, tname, info = extract_needed(zpath, work / "case")
     log(f"time step {tname} (steady-state result)")
